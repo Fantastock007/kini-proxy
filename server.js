@@ -1,17 +1,11 @@
 // Fiskaly Proxy (Node 18+) für RKSV Austria.
-// Warum Node statt Cloudflare Worker: Cloudflare/Deno akzeptieren die
-// TLS-Kette von sign-at.fiskaly.com aktuell nicht (HTTP 526 / UnknownIssuer).
-// Node nutzt den vollen Mozilla-CA-Store und verbindet sich sauber.
-//
-// Deploy: Render / Fly.io / Railway / eigenes VPS.
-// Start:  node server.js   (PORT env optional, Default 8080)
+// Leitet alle Anfragen an rksv.fiskaly.com weiter.
+// Start: node server.js (PORT env optional, Default 8080)
 
 import http from "node:http";
 import { request as httpsRequest } from "node:https";
 
-const UPSTREAM_HOST = "sign-at.fiskaly.com";
-// Per Header `x-fiskaly-upstream` wählbar (nur Whitelist).
-const ALLOWED_UPSTREAMS = new Set(["sign-at.fiskaly.com", "rksv.fiskaly.com"]);
+const UPSTREAM_HOST = "rksv.fiskaly.com";
 const PORT = Number(process.env.PORT || 8080);
 
 const HOP_BY_HOP = new Set([
@@ -20,7 +14,6 @@ const HOP_BY_HOP = new Set([
 ]);
 
 const server = http.createServer((clientReq, clientRes) => {
-  // CORS (nur nötig falls direkt vom Browser aufgerufen; sonst harmlos)
   if (clientReq.method === "OPTIONS") {
     clientRes.writeHead(204, {
       "Access-Control-Allow-Origin": "*",
@@ -40,17 +33,15 @@ const server = http.createServer((clientReq, clientRes) => {
   }
 
   const headers = { ...clientReq.headers };
-  const wanted = String(headers["x-fiskaly-upstream"] || "").toLowerCase();
-  const host = ALLOWED_UPSTREAMS.has(wanted) ? wanted : UPSTREAM_HOST;
   delete headers["x-fiskaly-upstream"];
   for (const h of Object.keys(headers)) {
     if (HOP_BY_HOP.has(h.toLowerCase())) delete headers[h];
   }
-  headers.host = host;
+  headers.host = UPSTREAM_HOST;
 
   const upstream = httpsRequest(
     {
-      host,
+      host: UPSTREAM_HOST,
       port: 443,
       method: clientReq.method,
       path: clientReq.url,
