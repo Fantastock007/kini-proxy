@@ -1,41 +1,77 @@
-const express = require('express');
-const app = express();
+// Fiskaly Proxy (Node 18+) für RKSV Austria.
+// Warum Node statt Cloudflare Worker: Cloudflare/Deno akzeptieren die
+// TLS-Kette von sign-at.fiskaly.com aktuell nicht (HTTP 526 / UnknownIssuer).
+// Node nutzt den vollen Mozilla-CA-Store und verbindet sich sauber.
+//
+// Deploy: Render / Fly.io / Railway / eigenes VPS.
+// Start:  node server.js   (PORT env optional, Default 8080)
 
-const FISKALY_BASE = 'https://rksv.fiskaly.com';
+import http from "node:http";
+import { request as httpsRequest } from "node:https";
 
-app.use(express.raw({ type: '*/*', limit: '5mb' }));
+const UPSTREAM_HOST = "sign-at.fiskaly.com";
+// Per Header `x-fiskaly-upstream` wählbar (nur Whitelist).
+const ALLOWED_UPSTREAMS = new Set(["sign-at.fiskaly.com", "rksv.fiskaly.com"]);
+const PORT = Number(process.env.PORT || 8080);
 
-app.get('/health', (req, res) => res.status(200).send('ok'));
+const HOP_BY_HOP = new Set([
+  "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+  "te", "trailers", "transfer-encoding", "upgrade", "host",
+]);
 
-app.all('/api/v1/*', async (req, res) => {
-  const targetUrl = FISKALY_BASE + req.originalUrl;
-
-  const headers = { ...req.headers };
-  delete headers.host;
-  delete headers['content-length'];
-
-  try {
-    const response = await fetch(targetUrl, {
-      method: req.method,
-      headers,
-      body: ['GET', 'HEAD'].includes(req.method) ? undefined : req.body,
+const server = http.createServer((clientReq, clientRes) => {
+  // CORS (nur nötig falls direkt vom Browser aufgerufen; sonst harmlos)
+  if (clientReq.method === "OPTIONS") {
+    clientRes.writeHead(204, {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+      "Access-Control-Allow-Headers": "authorization, content-type, x-request-id",
+      "Access-Control-Max-Age": "86400",
     });
-
-    res.status(response.status);
-    response.headers.forEach((value, key) => {
-      const lower = key.toLowerCase();
-      if (lower !== 'content-encoding' && lower !== 'transfer-encoding') {
-        res.setHeader(key, value);
-      }
-    });
-
-    const buffer = await response.arrayBuffer();
-    res.send(Buffer.from(buffer));
-  } catch (err) {
-    console.error('Proxy error:', err);
-    res.status(502).json({ error: 'Proxy error', message: err.message });
+    clientRes.end();
+    return;
   }
+
+  // Healthcheck
+  if (clientReq.url === "/health") {
+    clientRes.writeHead(200, { "Content-Type": "application/json" });
+    clientRes.end(JSON.stringify({ ok: true, upstream: UPSTREAM_HOST }));
+    return;
+  }
+
+  const headers = { ...clientReq.headers };
+  const wanted = String(headers["x-fiskaly-upstream"] || "").toLowerCase();
+  const host = ALLOWED_UPSTREAMS.has(wanted) ? wanted : UPSTREAM_HOST;
+  delete headers["x-fiskaly-upstream"];
+  for (const h of Object.keys(headers)) {
+    if (HOP_BY_HOP.has(h.toLowerCase())) delete headers[h];
+  }
+  headers.host = host;
+
+  const upstream = httpsRequest(
+    {
+      host,
+      port: 443,
+      method: clientReq.method,
+      path: clientReq.url,
+      headers,
+    },
+    (upRes) => {
+      const outHeaders = { ...upRes.headers, "Access-Control-Allow-Origin": "*" };
+      clientRes.writeHead(upRes.statusCode || 502, outHeaders);
+      upRes.pipe(clientRes);
+    },
+  );
+
+  upstream.on("error", (err) => {
+    console.error("[proxy] upstream error:", err.message);
+    clientRes.writeHead(502, { "Content-Type": "application/json" });
+    clientRes.end(JSON.stringify({ error: "upstream_error", message: err.message }));
+  });
+
+  clientReq.pipe(upstream);
 });
 
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`Fiskaly proxy running on port ${PORT}`));
+server.listen(PORT, () => {
+  console.log(`[fiskaly-proxy] listening on :${PORT} -> https://${UPSTREAM_HOST}`);
+});
